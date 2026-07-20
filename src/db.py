@@ -132,10 +132,11 @@ def fetch_available_taskids(conn=None):
 
 
 def fetch_task_row(taskid, conn=None):
-    """(taskid, status, product_gtin, line_id, marking_system, amount)
-    или None, если задание не найдено."""
+    """(taskid, status, product_gtin, line_id, marking_system, amount,
+    error_state, msg) или None, если задание не найдено."""
     return _run(
-        "SELECT taskid, status, product, line, marking_system, amount "
+        "SELECT taskid, status, product, line, marking_system, amount, "
+        "error_state, msg "
         "FROM tasks WHERE taskid = %s",
         (taskid,), "one", conn,
     )
@@ -145,6 +146,15 @@ def fetch_task_status(taskid, conn=None):
     """Текущий целочисленный статус задания или None."""
     row = _run("SELECT status FROM tasks WHERE taskid = %s", (taskid,), "one", conn)
     return row[0] if row else None
+
+
+def fetch_task_state(taskid, conn=None):
+    """(status, error_state, msg) задания или None — для поллинга:
+    статус и признак серверной ошибки одним запросом."""
+    return _run(
+        "SELECT status, error_state, msg FROM tasks WHERE taskid = %s",
+        (taskid,), "one", conn,
+    )
 
 
 def set_task_status(taskid, status, conn=None):

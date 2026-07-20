@@ -81,6 +81,17 @@ class AdvanceStopped(Exception):
     pass
 
 
+def _raise_if_error_state(taskid, status, error_state, msg):
+    """Сервер DMC пометил задание ошибкой (tasks.error_state) — дальше
+    работать с ним бессмысленно, завершаем с понятным сообщением."""
+    if error_state:
+        detail = f"\n\nСообщение сервера: {msg}" if msg else ""
+        raise AdvanceError(
+            f"Задание #{taskid} помечено сервером как ошибочное "
+            f"(error_state) на статусе {status}.{detail}"
+        )
+
+
 def _chunked(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
@@ -102,9 +113,11 @@ def wait_until_ready(taskid, poll_interval=3.0, on_progress=None, stop_flag=None
     while True:
         if stop_flag is not None and stop_flag.is_set():
             raise AdvanceStopped("Остановлено пользователем")
-        status = db.fetch_task_status(taskid)
-        if status is None:
+        row = db.fetch_task_state(taskid)
+        if row is None:
             raise AdvanceError(f"Задание #{taskid} не найдено в БД")
+        status, error_state, msg = row
+        _raise_if_error_state(taskid, status, error_state, msg)
         if status in ALLOWED_ENTRY_STATUSES:
             progress(f"Задание готово (статус {status})")
             return status
@@ -143,7 +156,9 @@ def advance_task(taskid, target_status, poll_interval=3.0,
     row = db.fetch_task_row(taskid)
     if row is None:
         raise AdvanceError(f"Задание #{taskid} не найдено в БД")
-    _, entry_status, product_gtin, line_id, marking_system, amount = row
+    (_, entry_status, product_gtin, line_id, marking_system, amount,
+     error_state, err_msg) = row
+    _raise_if_error_state(taskid, entry_status, error_state, err_msg)
     if entry_status not in ALLOWED_ENTRY_STATUSES:
         raise AdvanceError(
             f"Задание #{taskid} в статусе {entry_status}, "
@@ -219,7 +234,11 @@ def advance_task(taskid, target_status, poll_interval=3.0,
             stuck_since = None
             while True:
                 check_stop()
-                current = db.fetch_task_status(taskid)
+                state_row = db.fetch_task_state(taskid)
+                if state_row is None:
+                    raise AdvanceError(f"Задание #{taskid} не найдено в БД")
+                current, error_state, err_msg = state_row
+                _raise_if_error_state(taskid, current, error_state, err_msg)
                 if current in accepted:
                     if current != expected_status:
                         progress(
@@ -254,7 +273,11 @@ def advance_task(taskid, target_status, poll_interval=3.0,
         # переводим в 9 самостоятельно через API.
         time.sleep(poll_interval)
         check_stop()
-        current = db.fetch_task_status(taskid)
+        state_row = db.fetch_task_state(taskid)
+        if state_row is None:
+            raise AdvanceError(f"Задание #{taskid} не найдено в БД")
+        current, error_state, err_msg = state_row
+        _raise_if_error_state(taskid, current, error_state, err_msg)
         if current == STATUS_DONE_SERIALIZING:
             progress("patch:9")
             api.patch_task_status(taskid, STATUS_READY_FOR_APPLY)
