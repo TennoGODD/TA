@@ -2,6 +2,7 @@
 
 import os
 import sys
+import json
 import subprocess
 import threading
 from datetime import datetime
@@ -12,7 +13,7 @@ import db
 import theme as t
 import storage
 import notifications
-from paths import TASKS_FILE, LOG_DIR
+from paths import TASKS_FILE, LOG_DIR, UI_CONFIG_FILE
 from api_client import (
     LOG_FILE, get_api_settings, save_api_settings, test_api_connection,
 )
@@ -26,6 +27,29 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 TASKS_FILE = str(TASKS_FILE)
+
+SIDEBAR_EXPANDED_WIDTH = 230
+SIDEBAR_COLLAPSED_WIDTH = 48
+
+
+def _load_sidebar_collapsed() -> bool:
+    if UI_CONFIG_FILE.exists():
+        try:
+            data = json.loads(UI_CONFIG_FILE.read_text(encoding="utf-8"))
+            return bool(data.get("sidebar_collapsed", False))
+        except Exception:
+            pass
+    return False
+
+
+def _save_sidebar_collapsed(value: bool) -> None:
+    try:
+        UI_CONFIG_FILE.write_text(
+            json.dumps({"sidebar_collapsed": value}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 # Подписи целей в выпадающем списке (описания статусов из DMC)
 TARGET_CHOICES = {
@@ -192,27 +216,44 @@ class TaskAdvancerApp(ctk.CTk):
     # Сайдбар
     # ======================================================================
     def _build_sidebar(self):
-        sidebar = ctk.CTkFrame(self, width=230, corner_radius=0, fg_color=t.COLOR_BG_SIDEBAR)
+        sidebar = ctk.CTkFrame(self, width=SIDEBAR_EXPANDED_WIDTH, corner_radius=0,
+                                fg_color=t.COLOR_BG_SIDEBAR)
         sidebar.grid(row=0, column=0, sticky="nswe")
         sidebar.grid_propagate(False)
+        self.sidebar = sidebar
 
-        ctk.CTkLabel(sidebar, text="⏩ Task Advancer", font=t.FONT_TITLE, text_color=t.COLOR_ACCENT).pack(
-            padx=20, pady=(24, 0), anchor="w")
-        ctk.CTkLabel(sidebar, text="Продвижение заданий по статусам", font=t.FONT_SUBTITLE,
+        # Кнопка-стрелка сворачивания — единственное, что остаётся видимым
+        # в свёрнутой узкой полоске; пакуется ДО sidebar_body, поэтому
+        # переживает скрытие содержимого.
+        self.sidebar_toggle_btn = ctk.CTkButton(
+            sidebar, text="◀", width=28, height=28, font=t.FONT_LABEL,
+            command=self.toggle_sidebar, **t.ghost_button_style(),
+        )
+        self.sidebar_toggle_btn.pack(pady=(14, 4))
+
+        # Всё остальное содержимое сайдбара живёт в отдельном фрейме —
+        # его целиком прячем при сворачивании, ничего больше не трогая.
+        body = ctk.CTkFrame(sidebar, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        self.sidebar_body = body
+
+        ctk.CTkLabel(body, text="⏩ Task Advancer", font=t.FONT_TITLE, text_color=t.COLOR_ACCENT).pack(
+            padx=20, pady=(4, 0), anchor="w")
+        ctk.CTkLabel(body, text="Продвижение заданий по статусам", font=t.FONT_SUBTITLE,
                      text_color=t.COLOR_TEXT_MUTED).pack(padx=20, pady=(0, 20), anchor="w")
 
-        ctk.CTkFrame(sidebar, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkFrame(body, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=(0, 16))
 
         def side_btn(text, command):
             return ctk.CTkButton(
-                sidebar, text=text, command=command, anchor="w",
+                body, text=text, command=command, anchor="w",
                 fg_color="transparent", text_color=t.COLOR_TEXT,
                 hover_color=t.COLOR_SURFACE_2, font=t.FONT_LABEL, height=38,
             )
 
         side_btn("🔄  Обновить список заданий", self.refresh_taskids).pack(fill="x", padx=12, pady=3)
         side_btn("🧹  Убрать завершённые", self.clear_finished).pack(fill="x", padx=12, pady=3)
-        ctk.CTkFrame(sidebar, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=16)
+        ctk.CTkFrame(body, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=16)
         side_btn("⚙️  Настройки", self.open_settings).pack(fill="x", padx=12, pady=3)
         side_btn("📁  Открыть папку логов", self.open_logs).pack(fill="x", padx=12, pady=3)
         # 🚮 вместо 🗑️ — та же корзина, но без модификатора стиля (U+FE0F),
@@ -221,8 +262,40 @@ class TaskAdvancerApp(ctk.CTk):
         # сайдбара с anchor="w").
         side_btn("🚮  Очистить лог", self.clear_log).pack(fill="x", padx=12, pady=3)
 
-        ctk.CTkFrame(sidebar, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=16)
+        ctk.CTkFrame(body, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=16)
         side_btn("🔁  Перезапустить приложение", self.restart_application).pack(fill="x", padx=12, pady=3)
+
+        self._sidebar_collapsed = _load_sidebar_collapsed()
+        if self._sidebar_collapsed:
+            # Применяем сохранённое состояние сразу, без анимации.
+            self.sidebar_body.pack_forget()
+            self.sidebar.configure(width=SIDEBAR_COLLAPSED_WIDTH)
+            self.sidebar_toggle_btn.configure(text="▶")
+
+    def toggle_sidebar(self):
+        collapsed = not self._sidebar_collapsed
+        self._sidebar_collapsed = collapsed
+        _save_sidebar_collapsed(collapsed)
+        self.sidebar_toggle_btn.configure(text="▶" if collapsed else "◀")
+
+        # Мгновенная смена ширины одним шагом — пошаговая анимация
+        # заставляла главную область пересчитывать раскладку на каждом
+        # кадре и это выглядело как мерцание, а не плавное движение.
+        if collapsed:
+            self.sidebar_body.pack_forget()
+            self.sidebar.configure(width=SIDEBAR_COLLAPSED_WIDTH)
+        else:
+            self.sidebar.configure(width=SIDEBAR_EXPANDED_WIDTH)
+            self.sidebar_body.pack(fill="both", expand=True)
+
+        # Короткая вспышка цвета самой кнопки — единственное, что реально
+        # анимируется. Она не требует relayout'а (просто перекраска одной
+        # маленькой кнопки), поэтому не мерцает, но даёт понять, что клик
+        # сработал, а не выглядит немым мгновенным рывком.
+        self.sidebar_toggle_btn.configure(fg_color=t.COLOR_ACCENT_SOFT)
+        self.sidebar_toggle_btn.after(
+            120, lambda: self.sidebar_toggle_btn.configure(fg_color="transparent")
+        )
 
     # ======================================================================
     # Основная область

@@ -31,6 +31,7 @@ TASKS_FILE = BASE_DIR / "tasks.json"
 DB_CONFIG_FILE = BASE_DIR / "db_config.json"
 API_CONFIG_FILE = BASE_DIR / "api_config.json"
 APP_CONFIG_FILE = BASE_DIR / "app_config.json"
+UI_CONFIG_FILE = BASE_DIR / "ui_config.json"
 ICON_FILE = resource_path("assets", "app.ico")
 
 LOG_DIR.mkdir(exist_ok=True)
