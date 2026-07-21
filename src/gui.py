@@ -215,7 +215,11 @@ class TaskAdvancerApp(ctk.CTk):
         ctk.CTkFrame(sidebar, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=16)
         side_btn("⚙️  Настройки", self.open_settings).pack(fill="x", padx=12, pady=3)
         side_btn("📁  Открыть папку логов", self.open_logs).pack(fill="x", padx=12, pady=3)
-        side_btn("🗑️  Очистить лог", self.clear_log).pack(fill="x", padx=12, pady=3)
+        # 🚮 вместо 🗑️ — та же корзина, но без модификатора стиля (U+FE0F),
+        # который у этого конкретного эмодзи сбивал расчёт ширины текста
+        # в Tk и сдвигал подпись вправо (заметно на широкой кнопке
+        # сайдбара с anchor="w").
+        side_btn("🚮  Очистить лог", self.clear_log).pack(fill="x", padx=12, pady=3)
 
         ctk.CTkFrame(sidebar, height=1, fg_color=t.COLOR_BORDER).pack(fill="x", padx=16, pady=16)
         side_btn("🔁  Перезапустить приложение", self.restart_application).pack(fill="x", padx=12, pady=3)
@@ -420,6 +424,8 @@ class TaskAdvancerApp(ctk.CTk):
                 rec = self.tasks.get(taskid, {})
                 if rec.get("wait_ready"):
                     btn_text, btn_width = "⏳ Ждать готовности", 160
+                elif state == TaskState.STOPPED:
+                    btn_text, btn_width = "▶️ Продолжить", 130
                 else:
                     btn_text, btn_width = "▶️ Запустить", 110
                 ctk.CTkButton(
@@ -429,12 +435,6 @@ class TaskAdvancerApp(ctk.CTk):
                     command=lambda i=taskid: self.start_task(i),
                 ).pack(side="left", padx=3)
             elif state == TaskState.ERROR:
-                ctk.CTkButton(
-                    actions, text="🔁 Повторить", width=115, height=32,
-                    fg_color=t.COLOR_GREEN_SOFT, hover_color=t.COLOR_GREEN,
-                    text_color=t.COLOR_GREEN,
-                    command=lambda i=taskid: self.start_task(i),
-                ).pack(side="left", padx=3)
                 ctk.CTkButton(
                     actions, text="❓ Ошибка", width=100, height=32,
                     fg_color=t.COLOR_SURFACE_3, hover_color=t.COLOR_ACCENT_SOFT,
@@ -509,13 +509,16 @@ class TaskAdvancerApp(ctk.CTk):
         self.taskid_field.set("")
         self._refresh_tasks_view()
         self.save_tasks()
+        # Запускаем сразу в обоих случаях: для подготовительных статусов
+        # (0/1/2) воркер сначала сам дождётся готовности (3/6), а затем
+        # автоматически начнёт продвижение — дополнительных нажатий не нужно.
+        self.start_task(taskid)
         if wait_ready:
             self.status_var.set(
                 f"Задание #{taskid} в подготовительном статусе {status} — "
-                f"нажмите «⏳ Ждать готовности» на карточке"
+                f"ждём готовности (3/6), запуск будет автоматически"
             )
         else:
-            self.start_task(taskid)
             # Задание ушло в работу — из списка доступных (статус 3/6) оно
             # скоро пропадёт, обновляем подсказки.
             self._async_reload_taskids()

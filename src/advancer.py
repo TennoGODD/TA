@@ -55,6 +55,14 @@ PIPELINE_AFTER_SERIALIZING = (
     9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 60, 61, 62, 80, 90, 99,
 )
 
+# Статусы, с которых можно ВОЗОБНОВИТЬ продвижение после остановки, не
+# повторяя верификацию КМ и сборку агрегатов. Если задание уже дошло до
+# 8 (сериализация завершена) или дальше — эта работа гарантированно
+# выполнена предыдущим запуском (патч в 8 отправляется только после
+# успешного завершения агрегации), повторять её не нужно и небезопасно
+# (риск дублирующего build_aggregate).
+RESUMABLE_STATUSES = (STATUS_DONE_SERIALIZING,) + PIPELINE_AFTER_SERIALIZING
+
 
 def _statuses_at_or_after(status):
     """Множество статусов «магистрали», означающих, что status уже
@@ -81,14 +89,13 @@ class AdvanceStopped(Exception):
     pass
 
 
-def _raise_if_error_state(taskid, status, error_state, msg):
+def _raise_if_error_state(taskid, status, error_state):
     """Сервер DMC пометил задание ошибкой (tasks.error_state) — дальше
     работать с ним бессмысленно, завершаем с понятным сообщением."""
     if error_state:
-        detail = f"\n\nСообщение сервера: {msg}" if msg else ""
         raise AdvanceError(
-            f"Задание #{taskid} помечено сервером как ошибочное "
-            f"(error_state) на статусе {status}.{detail}"
+            f"Задание #{taskid}: появилась ошибка (error_state) "
+            f"на статусе {status} — работа с заданием остановлена"
         )
 
 
@@ -116,8 +123,8 @@ def wait_until_ready(taskid, poll_interval=3.0, on_progress=None, stop_flag=None
         row = db.fetch_task_state(taskid)
         if row is None:
             raise AdvanceError(f"Задание #{taskid} не найдено в БД")
-        status, error_state, msg = row
-        _raise_if_error_state(taskid, status, error_state, msg)
+        status, error_state = row
+        _raise_if_error_state(taskid, status, error_state)
         if status in ALLOWED_ENTRY_STATUSES:
             progress(f"Задание готово (статус {status})")
             return status
@@ -157,66 +164,75 @@ def advance_task(taskid, target_status, poll_interval=3.0,
     if row is None:
         raise AdvanceError(f"Задание #{taskid} не найдено в БД")
     (_, entry_status, product_gtin, line_id, marking_system, amount,
-     error_state, err_msg) = row
-    _raise_if_error_state(taskid, entry_status, error_state, err_msg)
-    if entry_status not in ALLOWED_ENTRY_STATUSES:
+     error_state) = row
+    _raise_if_error_state(taskid, entry_status, error_state)
+
+    fresh_start = entry_status in ALLOWED_ENTRY_STATUSES
+    if not fresh_start and entry_status not in RESUMABLE_STATUSES:
         raise AdvanceError(
             f"Задание #{taskid} в статусе {entry_status}, "
             f"ожидался {STATUS_READY_TO_PRINT} (готово к печати) или "
-            f"{STATUS_READY_FOR_SERIALIZATION} (готово к сериализации)"
+            f"{STATUS_READY_FOR_SERIALIZATION} (готово к сериализации) "
+            f"для начала работы"
         )
 
     api = TaskExecutor()
     api.start()
     try:
-        # ---- Шаг 1. Верификация всех КМ ----
-        check_stop()
-        progress("verify_dm")
-        updated = db.verify_all_dm(taskid)
-        progress(f"Верифицировано КМ: {updated}")
-
-        # ---- Шаги 2-3. Агрегация (снизу вверх) ----
-        check_stop()
-        dims = db.fetch_task_dimensions(taskid)
-        prev_level_ids = []
-        for level, aggr_id, size, aggr_gtin in dims:
+        if fresh_start:
+            # ---- Шаг 1. Верификация всех КМ ----
             check_stop()
-            existing = db.fetch_aggregates_by_level(taskid, level)
-            if existing:
-                # Уровень уже с кодами (КИГУ предзарезервированы сервером,
-                # либо повторный запуск после частичного прогона) —
-                # верифицируем и, для уровня 0, привязываем КМ к агрегатам
-                # (dm.aggregate — «parent_id» кода; на реальной линии эту
-                # привязку делает Monitor при сборке).
-                progress(f"verify_aggregates:level{level} ({len(existing)} шт.)")
-                db.verify_aggregates(taskid, level)
-                if level == 0 and size > 0:
-                    assigned = db.assign_dm_to_level0(taskid, existing, size)
-                    if assigned:
-                        progress(f"Привязано КМ к агрегатам ур.0: {assigned}")
-                prev_level_ids = existing
-                continue
+            progress("verify_dm")
+            updated = db.verify_all_dm(taskid)
+            progress(f"Верифицировано КМ: {updated}")
 
-            # Кодов уровня нет — собираем через build_aggregate.
-            # Дети: агрегаты уровня ниже, а если их нет — сами КМ.
-            children = prev_level_ids or db.fetch_dm_ids(taskid)
-            if not children:
-                raise AdvanceError(
-                    f"Уровень {level}: нет дочерних кодов для сборки "
-                    f"(ни агрегатов ниже, ни КМ задания)"
-                )
-            if size <= 0:
-                raise AdvanceError(f"Уровень {level}: некорректный size={size}")
-            chunk_size = min(size, BUILD_AGGREGATE_MAX_CONTENT)
-            code_gtin = aggr_gtin or product_gtin
-            progress(f"build:level{level} ({len(children)} детей по {chunk_size})")
-            for chunk in _chunked(children, chunk_size):
+            # ---- Шаги 2-3. Агрегация (снизу вверх) ----
+            check_stop()
+            dims = db.fetch_task_dimensions(taskid)
+            prev_level_ids = []
+            for level, aggr_id, size, aggr_gtin in dims:
                 check_stop()
-                parent_code = generate_dmc_code(level, code_gtin, line_id)
-                api.build_aggregate(level, parent_code, chunk)
-            db.verify_aggregates(taskid, level)
-            prev_level_ids = db.fetch_aggregates_by_level(taskid, level)
-            progress(f"build:level{level} готово ({len(prev_level_ids)} агрегатов)")
+                existing = db.fetch_aggregates_by_level(taskid, level)
+                if existing:
+                    # Уровень уже с кодами (КИГУ предзарезервированы
+                    # сервером, либо повторный запуск после частичного
+                    # прогона) — верифицируем и, для уровня 0, привязываем
+                    # КМ к агрегатам (dm.aggregate — «parent_id» кода; на
+                    # реальной линии эту привязку делает Monitor при сборке).
+                    progress(f"verify_aggregates:level{level} ({len(existing)} шт.)")
+                    db.verify_aggregates(taskid, level)
+                    if level == 0 and size > 0:
+                        assigned = db.assign_dm_to_level0(taskid, existing, size)
+                        if assigned:
+                            progress(f"Привязано КМ к агрегатам ур.0: {assigned}")
+                    prev_level_ids = existing
+                    continue
+
+                # Кодов уровня нет — собираем через build_aggregate.
+                # Дети: агрегаты уровня ниже, а если их нет — сами КМ.
+                children = prev_level_ids or db.fetch_dm_ids(taskid)
+                if not children:
+                    raise AdvanceError(
+                        f"Уровень {level}: нет дочерних кодов для сборки "
+                        f"(ни агрегатов ниже, ни КМ задания)"
+                    )
+                if size <= 0:
+                    raise AdvanceError(f"Уровень {level}: некорректный size={size}")
+                chunk_size = min(size, BUILD_AGGREGATE_MAX_CONTENT)
+                code_gtin = aggr_gtin or product_gtin
+                progress(f"build:level{level} ({len(children)} детей по {chunk_size})")
+                for chunk in _chunked(children, chunk_size):
+                    check_stop()
+                    parent_code = generate_dmc_code(level, code_gtin, line_id)
+                    api.build_aggregate(level, parent_code, chunk)
+                db.verify_aggregates(taskid, level)
+                prev_level_ids = db.fetch_aggregates_by_level(taskid, level)
+                progress(f"build:level{level} готово ({len(prev_level_ids)} агрегатов)")
+        else:
+            # Возобновление после остановки: статус 8 или дальше означает,
+            # что верификация КМ и сборка агрегатов уже завершены в
+            # предыдущем запуске — просто продолжаем со статуса задания.
+            progress(f"Возобновление с текущего статуса {entry_status}")
 
         # ---- Шаг 4. Продвижение по статусам ----
         def poll_until(expected_status, phase, retry_from=None, retry_push=None):
@@ -237,8 +253,8 @@ def advance_task(taskid, target_status, poll_interval=3.0,
                 state_row = db.fetch_task_state(taskid)
                 if state_row is None:
                     raise AdvanceError(f"Задание #{taskid} не найдено в БД")
-                current, error_state, err_msg = state_row
-                _raise_if_error_state(taskid, current, error_state, err_msg)
+                current, error_state = state_row
+                _raise_if_error_state(taskid, current, error_state)
                 if current in accepted:
                     if current != expected_status:
                         progress(
@@ -262,25 +278,33 @@ def advance_task(taskid, target_status, poll_interval=3.0,
                 time.sleep(poll_interval)
 
         check_stop()
-        if entry_status == STATUS_READY_TO_PRINT:
-            progress("patch:6")
-            api.patch_task_status(taskid, STATUS_READY_FOR_SERIALIZATION)
+        if fresh_start:
+            if entry_status == STATUS_READY_TO_PRINT:
+                progress("patch:6")
+                api.patch_task_status(taskid, STATUS_READY_FOR_SERIALIZATION)
 
-        progress("patch:8")
-        api.patch_task_status(taskid, STATUS_DONE_SERIALIZING)
-        # Даём серверу один интервал на обработку статуса 8 (пересчёт
-        # счётчиков и т.п.); если он сам не продвинул задание дальше —
-        # переводим в 9 самостоятельно через API.
-        time.sleep(poll_interval)
-        check_stop()
-        state_row = db.fetch_task_state(taskid)
-        if state_row is None:
-            raise AdvanceError(f"Задание #{taskid} не найдено в БД")
-        current, error_state, err_msg = state_row
-        _raise_if_error_state(taskid, current, error_state, err_msg)
+            progress("patch:8")
+            api.patch_task_status(taskid, STATUS_DONE_SERIALIZING)
+            current = STATUS_DONE_SERIALIZING
+        else:
+            # Возобновление: статус 6/8 уже пройден раньше, начинаем с
+            # того, что реально стоит в БД сейчас.
+            current = entry_status
+
         if current == STATUS_DONE_SERIALIZING:
-            progress("patch:9")
-            api.patch_task_status(taskid, STATUS_READY_FOR_APPLY)
+            # Даём серверу один интервал на обработку статуса 8 (пересчёт
+            # счётчиков и т.п.); если он сам не продвинул задание дальше —
+            # переводим в 9 самостоятельно через API.
+            time.sleep(poll_interval)
+            check_stop()
+            state_row = db.fetch_task_state(taskid)
+            if state_row is None:
+                raise AdvanceError(f"Задание #{taskid} не найдено в БД")
+            current, error_state = state_row
+            _raise_if_error_state(taskid, current, error_state)
+            if current == STATUS_DONE_SERIALIZING:
+                progress("patch:9")
+                api.patch_task_status(taskid, STATUS_READY_FOR_APPLY)
         current = poll_until(STATUS_READY_FOR_APPLY, "подтверждение статуса 9")
         if target_status == STATUS_READY_FOR_APPLY:
             progress("Цель достигнута: 9")

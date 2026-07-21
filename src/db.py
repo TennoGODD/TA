@@ -133,10 +133,10 @@ def fetch_available_taskids(conn=None):
 
 def fetch_task_row(taskid, conn=None):
     """(taskid, status, product_gtin, line_id, marking_system, amount,
-    error_state, msg) или None, если задание не найдено."""
+    error_state) или None, если задание не найдено."""
     return _run(
         "SELECT taskid, status, product, line, marking_system, amount, "
-        "error_state, msg "
+        "error_state "
         "FROM tasks WHERE taskid = %s",
         (taskid,), "one", conn,
     )
@@ -149,10 +149,10 @@ def fetch_task_status(taskid, conn=None):
 
 
 def fetch_task_state(taskid, conn=None):
-    """(status, error_state, msg) задания или None — для поллинга:
-    статус и признак серверной ошибки одним запросом."""
+    """(status, error_state) задания или None — для поллинга: статус и
+    признак серверной ошибки одним запросом."""
     return _run(
-        "SELECT status, error_state, msg FROM tasks WHERE taskid = %s",
+        "SELECT status, error_state FROM tasks WHERE taskid = %s",
         (taskid,), "one", conn,
     )
 
