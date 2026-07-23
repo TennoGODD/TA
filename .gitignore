@@ -23,5 +23,4 @@ logs/
 db_config.json
 api_config.json
 app_config.json
-ui_config.json
 tasks.json
